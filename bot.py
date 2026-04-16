@@ -8,19 +8,25 @@ from typing import Any, Final
 from urllib.parse import urlparse
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
 
-COMMAND_PREFIX: Final[str] = "!"
 DELETE_DELAY_SECONDS: Final[float] = 0.4
 DEFAULT_LINK_MESSAGE: Final[str] = "New Link"
-DEFAULT_REPLY_DELETE_AFTER: Final[float] = 10
 SETTINGS_FILE: Final[str] = "guild_settings.json"
 LOG_FILE: Final[str] = "linkbot.log"
 LOG_MAX_BYTES: Final[int] = 1_000_000
 LOG_BACKUP_COUNT: Final[int] = 3
-URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"https?://\S+")
+URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:https?://|www\.)\S+")
+
+ACTION_CHOICES: Final[list[app_commands.Choice[str]]] = [
+    app_commands.Choice(name="List", value="list"),
+    app_commands.Choice(name="Add", value="add"),
+    app_commands.Choice(name="Remove", value="remove"),
+    app_commands.Choice(name="Clear", value="clear"),
+]
 
 logger = logging.getLogger("linkbot")
 
@@ -41,6 +47,22 @@ def normalize_id_list(raw_values: object) -> list[int]:
     return sorted(normalized_values)
 
 
+def normalize_id_map(raw_values: object) -> dict[str, int]:
+    if not isinstance(raw_values, dict):
+        return {}
+
+    normalized_values: dict[str, int] = {}
+    for key, value in raw_values.items():
+        if isinstance(value, int):
+            normalized_values[str(key)] = value
+            continue
+
+        if isinstance(value, str) and value.isdigit():
+            normalized_values[str(key)] = int(value)
+
+    return normalized_values
+
+
 def normalize_settings(raw_settings: object) -> dict[str, dict[str, Any]]:
     if not isinstance(raw_settings, dict):
         return {}
@@ -58,6 +80,10 @@ def normalize_settings(raw_settings: object) -> dict[str, dict[str, Any]]:
             "message_prefix": message_prefix.strip(),
             "allowed_channel_ids": normalize_id_list(values.get("allowed_channel_ids")),
             "allowed_role_ids": normalize_id_list(values.get("allowed_role_ids")),
+            "managed_channel_ids": normalize_id_list(values.get("managed_channel_ids")),
+            "preserve_before_message_ids": normalize_id_map(
+                values.get("preserve_before_message_ids")
+            ),
         }
 
     return normalized_settings
@@ -95,6 +121,8 @@ def get_guild_config(guild_id: int) -> dict[str, Any]:
             "message_prefix": DEFAULT_LINK_MESSAGE,
             "allowed_channel_ids": [],
             "allowed_role_ids": [],
+            "managed_channel_ids": [],
+            "preserve_before_message_ids": {},
         }
         return guild_settings[guild_key]
 
@@ -102,6 +130,8 @@ def get_guild_config(guild_id: int) -> dict[str, Any]:
     guild_config.setdefault("message_prefix", DEFAULT_LINK_MESSAGE)
     guild_config.setdefault("allowed_channel_ids", [])
     guild_config.setdefault("allowed_role_ids", [])
+    guild_config.setdefault("managed_channel_ids", [])
+    guild_config.setdefault("preserve_before_message_ids", {})
     return guild_config
 
 
@@ -128,6 +158,18 @@ def get_allowed_channel_ids(guild_id: int) -> list[int]:
 
 def get_allowed_role_ids(guild_id: int) -> list[int]:
     return list(get_guild_config(guild_id)["allowed_role_ids"])
+
+
+def get_managed_channel_ids(guild_id: int) -> list[int]:
+    return list(get_guild_config(guild_id)["managed_channel_ids"])
+
+
+def get_preserve_before_message_id(guild_id: int, channel_id: int) -> int | None:
+    raw_value = get_guild_config(guild_id)["preserve_before_message_ids"].get(str(channel_id))
+    if isinstance(raw_value, int):
+        return raw_value
+
+    return None
 
 
 def add_allowed_channel(guild_id: int, channel_id: int) -> bool:
@@ -184,8 +226,31 @@ def clear_allowed_roles(guild_id: int) -> None:
     save_settings()
 
 
+def add_managed_channel(
+    guild_id: int,
+    channel_id: int,
+    *,
+    preserve_before_message_id: int | None = None,
+) -> None:
+    managed_channel_ids = set(get_managed_channel_ids(guild_id))
+    managed_channel_ids.add(channel_id)
+    guild_config = get_guild_config(guild_id)
+    guild_config["managed_channel_ids"] = sorted(managed_channel_ids)
+
+    preserve_before_message_ids = dict(guild_config["preserve_before_message_ids"])
+    if preserve_before_message_id is not None:
+        preserve_before_message_ids[str(channel_id)] = preserve_before_message_id
+    guild_config["preserve_before_message_ids"] = preserve_before_message_ids
+
+    save_settings()
+
+
 def normalize_url(value: str) -> str:
-    return value.strip().strip("<>").rstrip(".,!?)")
+    normalized_value = value.strip().strip("<>").rstrip(".,!?)")
+    if normalized_value.lower().startswith("www."):
+        return f"https://{normalized_value}"
+
+    return normalized_value
 
 
 def is_valid_url(value: str) -> bool:
@@ -266,33 +331,43 @@ def current_channel_ids(channel: discord.abc.GuildChannel | discord.Thread) -> s
     return channel_ids
 
 
-def get_link_access_denial_reason(ctx: commands.Context) -> str | None:
-    if ctx.guild is None:
-        return "This command only works in server channels."
+def is_managed_link_channel(channel: discord.TextChannel | discord.Thread) -> bool:
+    managed_channel_ids = set(get_managed_channel_ids(channel.guild.id))
+    if channel.id not in managed_channel_ids:
+        return False
 
-    if not isinstance(ctx.channel, (discord.TextChannel, discord.Thread)):
-        return "This command only works in text channels and threads."
+    allowed_channel_ids = set(get_allowed_channel_ids(channel.guild.id))
+    if not allowed_channel_ids:
+        return True
 
-    if is_server_manager(ctx.author):
+    return bool(current_channel_ids(channel) & allowed_channel_ids)
+
+
+def get_link_access_denial_reason(
+    guild: discord.Guild,
+    channel: discord.TextChannel | discord.Thread,
+    member: discord.Member,
+) -> str | None:
+    if is_server_manager(member):
         return None
 
-    allowed_channel_ids = set(get_allowed_channel_ids(ctx.guild.id))
-    if allowed_channel_ids and not (current_channel_ids(ctx.channel) & allowed_channel_ids):
+    allowed_channel_ids = set(get_allowed_channel_ids(guild.id))
+    if allowed_channel_ids and not (current_channel_ids(channel) & allowed_channel_ids):
         allowed_channels = ", ".join(
-            format_channel_reference(ctx.guild, channel_id)
+            format_channel_reference(guild, channel_id)
             for channel_id in sorted(allowed_channel_ids)
         )
-        return f"`!link` is only enabled in: {allowed_channels}"
+        return f"`/link` is only enabled in: {allowed_channels}"
 
-    allowed_role_ids = set(get_allowed_role_ids(ctx.guild.id))
-    if allowed_role_ids and isinstance(ctx.author, discord.Member):
-        author_role_ids = {role.id for role in ctx.author.roles}
+    allowed_role_ids = set(get_allowed_role_ids(guild.id))
+    if allowed_role_ids:
+        author_role_ids = {role.id for role in member.roles}
         if not (author_role_ids & allowed_role_ids):
             allowed_roles = ", ".join(
-                format_role_reference(ctx.guild, role_id)
+                format_role_reference(guild, role_id)
                 for role_id in sorted(allowed_role_ids)
             )
-            return f"You need one of these roles to use `!link`: {allowed_roles}"
+            return f"You need one of these roles to use `/link`: {allowed_roles}"
 
     return None
 
@@ -301,6 +376,12 @@ def status_lines(guild: discord.Guild) -> list[str]:
     message_prefix = get_message_prefix(guild.id)
     allowed_channel_ids = get_allowed_channel_ids(guild.id)
     allowed_role_ids = get_allowed_role_ids(guild.id)
+    managed_channel_ids = get_managed_channel_ids(guild.id)
+    safe_start_channel_ids = [
+        channel_id
+        for channel_id in managed_channel_ids
+        if get_preserve_before_message_id(guild.id, channel_id) is not None
+    ]
 
     channel_summary = "Any text channel"
     if allowed_channel_ids:
@@ -316,22 +397,44 @@ def status_lines(guild: discord.Guild) -> list[str]:
             for role_id in allowed_role_ids
         )
 
+    managed_summary = "None yet"
+    if managed_channel_ids:
+        managed_summary = ", ".join(
+            format_channel_reference(guild, channel_id)
+            for channel_id in managed_channel_ids
+        )
+
+    safe_start_summary = "None"
+    if safe_start_channel_ids:
+        safe_start_summary = ", ".join(
+            format_channel_reference(guild, channel_id)
+            for channel_id in safe_start_channel_ids
+        )
+
     return [
         "**LinkBot Status**",
         f"Message label: `{message_prefix}`",
         f"Allowed channels: {channel_summary}",
         f"Allowed roles: {role_summary}",
+        f"Managed channels: {managed_summary}",
+        f"Safe-start channels: {safe_start_summary}",
         f"Logs: `{LOG_FILE}`",
     ]
 
 
-async def reply_temp(
-    ctx: commands.Context,
-    message: str,
-    *,
-    delete_after: float | None = DEFAULT_REPLY_DELETE_AFTER,
-) -> None:
-    await ctx.reply(message, mention_author=False, delete_after=delete_after)
+async def send_ephemeral(interaction: discord.Interaction, message: str) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+        return
+
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+async def defer_ephemeral(interaction: discord.Interaction) -> None:
+    if interaction.response.is_done():
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
 
 async def send_link_message(
@@ -357,10 +460,14 @@ async def clean_channel(
     channel: discord.TextChannel | discord.Thread,
     keep_message_ids: set[int],
     bot_user_id: int,
+    preserve_before_message_id: int | None = None,
 ) -> int:
     deleted_count = 0
 
     async for message in channel.history(limit=None, oldest_first=False):
+        if preserve_before_message_id is not None and message.id <= preserve_before_message_id:
+            continue
+
         should_keep = message.id in keep_message_ids
         should_keep = should_keep or (
             message.author.id == bot_user_id and get_managed_link_url(message) is not None
@@ -379,16 +486,15 @@ async def clean_channel(
 async def collect_historical_links(
     channel: discord.TextChannel | discord.Thread,
     bot_user_id: int,
-    skip_message_ids: set[int] | None = None,
+    preserve_before_message_id: int | None = None,
 ) -> tuple[set[int], list[str]]:
     managed_message_ids: set[int] = set()
     managed_urls: set[str] = set()
     discovered_urls: list[str] = []
     discovered_url_set: set[str] = set()
-    skip_ids = skip_message_ids or set()
 
     async for message in channel.history(limit=None, oldest_first=True):
-        if message.id in skip_ids:
+        if preserve_before_message_id is not None and message.id <= preserve_before_message_id:
             continue
 
         managed_url = None
@@ -419,6 +525,134 @@ async def collect_historical_links(
     return managed_message_ids, links_to_repost
 
 
+def is_initialized_channel(guild_id: int, channel_id: int) -> bool:
+    return channel_id in set(get_managed_channel_ids(guild_id))
+
+
+async def get_channel_boundary_message_id(
+    channel: discord.TextChannel | discord.Thread,
+) -> int | None:
+    async for message in channel.history(limit=1, oldest_first=False):
+        return message.id
+
+    return None
+
+
+async def process_link_submission(
+    interaction: discord.Interaction,
+    normalized_url: str,
+    *,
+    safe_first_boot: bool = False,
+) -> None:
+    guild = interaction.guild
+    channel = interaction.channel
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await send_ephemeral(interaction, "This command only works inside a server.")
+        return
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await send_ephemeral(interaction, "This command only works in text channels and threads.")
+        return
+
+    if safe_first_boot and is_initialized_channel(guild.id, channel.id):
+        await send_ephemeral(
+            interaction,
+            "This channel has already been initialized. Use `/safe-link` only as the first LinkBot setup action in a channel.",
+        )
+        return
+
+    if not safe_first_boot:
+        denial_reason = get_link_access_denial_reason(guild, channel, user)
+        if denial_reason is not None:
+            await send_ephemeral(interaction, denial_reason)
+            return
+
+    await defer_ephemeral(interaction)
+
+    message_prefix = get_message_prefix(guild.id)
+    preserve_before_message_id = get_preserve_before_message_id(guild.id, channel.id)
+
+    try:
+        keep_message_ids: set[int] = set()
+        historical_links: list[str] = []
+        deleted_count = 0
+
+        if safe_first_boot:
+            preserve_before_message_id = await get_channel_boundary_message_id(channel)
+        else:
+            keep_message_ids, historical_links = await collect_historical_links(
+                channel,
+                bot_user_id=interaction.client.user.id,
+                preserve_before_message_id=preserve_before_message_id,
+            )
+
+            for historical_link in historical_links:
+                reposted_message = await send_link_message(
+                    channel,
+                    message_prefix=message_prefix,
+                    url=historical_link,
+                )
+                keep_message_ids.add(reposted_message.id)
+
+        reposted_message = await send_link_message(
+            channel,
+            message_prefix=message_prefix,
+            url=normalized_url,
+        )
+        keep_message_ids.add(reposted_message.id)
+
+        if safe_first_boot:
+            add_managed_channel(
+                guild.id,
+                channel.id,
+                preserve_before_message_id=preserve_before_message_id,
+            )
+        else:
+            deleted_count = await clean_channel(
+                channel,
+                keep_message_ids=keep_message_ids,
+                bot_user_id=interaction.client.user.id,
+                preserve_before_message_id=preserve_before_message_id,
+            )
+            add_managed_channel(guild.id, channel.id)
+
+        logger.info(
+            "Processed %s in guild=%s channel=%s user=%s historical_reposted=%s deleted=%s",
+            "safe-link" if safe_first_boot else "link",
+            guild.id,
+            channel.id,
+            user.id,
+            len(historical_links),
+            deleted_count,
+        )
+
+        summary = (
+            f"Posted your link in {channel.mention}. "
+            f"Historical links reposted: {len(historical_links)}. "
+            f"Messages removed: {deleted_count}."
+        )
+        if safe_first_boot:
+            summary = (
+                f"Safely initialized {channel.mention}. "
+                "Earlier channel history was preserved."
+            )
+
+        await interaction.followup.send(summary, ephemeral=True)
+    except discord.Forbidden:
+        logger.warning(
+            "Missing permissions while processing %s in guild=%s channel=%s.",
+            "safe-link" if safe_first_boot else "link",
+            guild.id,
+            channel.id,
+        )
+        await interaction.followup.send(
+            "I need `View Channel`, `Send Messages`, `Read Message History`, and `Manage Messages` in this channel.",
+            ephemeral=True,
+        )
+
+
 def configure_logging() -> None:
     log_level_name = os.getenv("LINKBOT_LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
@@ -442,12 +676,20 @@ def configure_logging() -> None:
     root_logger.addHandler(file_handler)
 
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.messages = True
+class LinkBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.messages = True
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+    async def setup_hook(self) -> None:
+        synced_commands = await self.tree.sync()
+        logger.info("Synced %s application command(s).", len(synced_commands))
+
+
+bot = LinkBot()
 
 
 @bot.event
@@ -471,300 +713,339 @@ async def on_guild_remove(guild: discord.Guild) -> None:
 
 
 @bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-    if isinstance(error, commands.CommandNotFound):
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or message.guild is None:
         return
 
-    if isinstance(error, commands.MissingRequiredArgument):
-        usage_by_command = {
-            "link": "`!link https://example.com`",
-            "link-channel": "`!link-channel add #links`, `!link-channel remove #links`, or `!link-channel clear`",
-            "link-role": "`!link-role add @role`, `!link-role remove @role`, or `!link-role clear`",
-        }
-        usage = usage_by_command.get(ctx.command.name if ctx.command else "", "`!link-help`")
-        await reply_temp(ctx, f"Missing `{error.param.name}`. Try {usage}.")
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
         return
 
-    if isinstance(error, commands.BadArgument):
-        await reply_temp(ctx, "I couldn't parse that command. Try `!link-help` for examples.")
+    if not is_managed_link_channel(message.channel):
         return
 
-    logger.exception("Unhandled command error in %s.", ctx.command.qualified_name if ctx.command else "unknown")
-    await reply_temp(ctx, "Something went wrong while running that command. Check `linkbot.log` for details.")
-
-
-@bot.command(name="link-help")
-async def link_help(ctx: commands.Context) -> None:
-    help_lines = [
-        "**LinkBot Commands**",
-        "`!link <url>` repost a link and clean the channel",
-        "`!link-message` show the current label",
-        "`!link-message <text>` set the label above each reposted link",
-        f"`!link-message-reset` restore the label to `{DEFAULT_LINK_MESSAGE}`",
-        "`!link-channel list|add|remove|clear [#channel]` control where `!link` can be used",
-        "`!link-role list|add|remove|clear [@role]` control which roles can use `!link`",
-        "`!link-status` show the current server settings",
-        "`!link-help` show this help message",
-        "Admins with `Manage Server` can always use the bot, even if channel or role restrictions are enabled.",
-    ]
-    await ctx.reply("\n".join(help_lines), mention_author=False)
-
-
-@bot.command(name="link-status")
-async def link_status(ctx: commands.Context) -> None:
-    if ctx.guild is None:
-        await reply_temp(ctx, "This command only works inside a server.")
+    try:
+        await safe_delete(message)
+    except discord.Forbidden:
+        logger.warning(
+            "Missing permissions while removing invalid message in managed channel guild=%s channel=%s.",
+            message.guild.id,
+            message.channel.id,
+        )
         return
 
-    await ctx.reply("\n".join(status_lines(ctx.guild)), mention_author=False)
+    logger.info(
+        "Removed invalid message in managed channel guild=%s channel=%s user=%s.",
+        message.guild.id,
+        message.channel.id,
+        message.author.id,
+    )
 
 
-@bot.command(name="link")
-async def link(ctx: commands.Context, *, url: str) -> None:
-    denial_reason = get_link_access_denial_reason(ctx)
-    if denial_reason is not None:
-        await reply_temp(ctx, denial_reason)
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.CheckFailure):
+        await send_ephemeral(interaction, "You need `Manage Server` to use that command.")
         return
 
-    if not isinstance(ctx.channel, (discord.TextChannel, discord.Thread)):
-        await reply_temp(ctx, "This command only works in text channels and threads.")
+    logger.exception("Unhandled app command error.")
+    await send_ephemeral(
+        interaction,
+        "Something went wrong while running that command. Check `linkbot.log` for details.",
+    )
+
+
+@bot.tree.command(name="link", description="Post a link and clean the current channel.")
+@app_commands.describe(url="The link to post")
+async def link_command(interaction: discord.Interaction, url: str) -> None:
+    normalized_url = normalize_url(url)
+    if not is_valid_url(normalized_url):
+        await send_ephemeral(
+            interaction,
+            "That doesn't look like a valid `http://`, `https://`, or `www.` link.",
+        )
+        return
+
+    await process_link_submission(interaction, normalized_url)
+
+
+@bot.tree.command(
+    name="safe-link",
+    description="Initialize a channel without deleting anything that was already there.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(url="The first link to post in the safely initialized channel")
+async def safe_link_command(interaction: discord.Interaction, url: str) -> None:
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(
+            interaction,
+            "You need `Manage Server` to use `/safe-link` because it initializes a channel in preserve mode.",
+        )
         return
 
     normalized_url = normalize_url(url)
     if not is_valid_url(normalized_url):
-        await reply_temp(ctx, "That doesn't look like a valid `http://` or `https://` link.")
+        await send_ephemeral(
+            interaction,
+            "That doesn't look like a valid `http://`, `https://`, or `www.` link.",
+        )
         return
 
-    message_prefix = get_message_prefix(ctx.guild.id if ctx.guild else None)
-
-    try:
-        keep_message_ids, historical_links = await collect_historical_links(
-            ctx.channel,
-            bot_user_id=ctx.bot.user.id,
-            skip_message_ids={ctx.message.id},
-        )
-
-        for historical_link in historical_links:
-            reposted_message = await send_link_message(
-                ctx.channel,
-                message_prefix=message_prefix,
-                url=historical_link,
-            )
-            keep_message_ids.add(reposted_message.id)
-
-        reposted_message = await send_link_message(
-            ctx.channel,
-            message_prefix=message_prefix,
-            url=normalized_url,
-        )
-        keep_message_ids.add(reposted_message.id)
-
-        deleted_count = await clean_channel(
-            ctx.channel,
-            keep_message_ids=keep_message_ids,
-            bot_user_id=ctx.bot.user.id,
-        )
-
-        logger.info(
-            "Processed link in guild=%s channel=%s user=%s url=%s historical_reposted=%s deleted=%s",
-            ctx.guild.id if ctx.guild else "dm",
-            ctx.channel.id,
-            ctx.author.id,
-            normalized_url,
-            len(historical_links),
-            deleted_count,
-        )
-    except discord.Forbidden:
-        logger.warning(
-            "Missing permissions while processing link in guild=%s channel=%s.",
-            ctx.guild.id if ctx.guild else "dm",
-            ctx.channel.id,
-        )
-        await reply_temp(
-            ctx,
-            "I need `View Channel`, `Send Messages`, `Read Message History`, and `Manage Messages` in this channel.",
-        )
+    await process_link_submission(interaction, normalized_url, safe_first_boot=True)
 
 
-@bot.command(name="link-message")
-async def link_message(ctx: commands.Context, *, message_prefix: str | None = None) -> None:
-    if ctx.guild is None:
-        await reply_temp(ctx, "This command only works inside a server.")
+@bot.tree.command(
+    name="link-message",
+    description="Show or update the label above each reposted link.",
+)
+@app_commands.guild_only()
+@app_commands.describe(message_prefix="Leave blank to see the current label")
+async def link_message_command(
+    interaction: discord.Interaction,
+    message_prefix: str | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
     if message_prefix is None:
-        await reply_temp(
-            ctx,
-            f"Current link message: `{get_message_prefix(ctx.guild.id)}`",
-            delete_after=15,
+        await send_ephemeral(
+            interaction,
+            f"Current link message: `{get_message_prefix(guild.id)}`",
         )
         return
 
-    if not is_server_manager(ctx.author):
-        await reply_temp(ctx, "You need `Manage Server` to change the link message.")
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(interaction, "You need `Manage Server` to change the link message.")
         return
 
     cleaned_prefix = message_prefix.strip()
     if not cleaned_prefix:
-        await reply_temp(ctx, "The link message cannot be empty.")
+        await send_ephemeral(interaction, "The link message cannot be empty.")
         return
 
-    set_message_prefix(ctx.guild.id, cleaned_prefix)
+    set_message_prefix(guild.id, cleaned_prefix)
     logger.info(
-        "Updated message prefix in guild=%s by user=%s to %r.",
-        ctx.guild.id,
-        ctx.author.id,
-        cleaned_prefix,
+        "Updated message prefix in guild=%s by user=%s.",
+        guild.id,
+        interaction.user.id,
     )
-    await reply_temp(ctx, f"Link message updated to `{cleaned_prefix}`.")
+    await send_ephemeral(interaction, f"Link message updated to `{cleaned_prefix}`.")
 
 
-@bot.command(name="link-message-reset")
-async def link_message_reset(ctx: commands.Context) -> None:
-    if ctx.guild is None:
-        await reply_temp(ctx, "This command only works inside a server.")
+@bot.tree.command(
+    name="link-message-reset",
+    description="Reset the link label back to the default value.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def link_message_reset_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
-    if not is_server_manager(ctx.author):
-        await reply_temp(ctx, "You need `Manage Server` to reset the link message.")
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(interaction, "You need `Manage Server` to reset the link message.")
         return
 
-    reset_message_prefix(ctx.guild.id)
-    logger.info("Reset message prefix in guild=%s by user=%s.", ctx.guild.id, ctx.author.id)
-    await reply_temp(ctx, f"Link message reset to `{DEFAULT_LINK_MESSAGE}`.")
+    reset_message_prefix(guild.id)
+    logger.info("Reset message prefix in guild=%s by user=%s.", guild.id, interaction.user.id)
+    await send_ephemeral(interaction, f"Link message reset to `{DEFAULT_LINK_MESSAGE}`.")
 
 
-@bot.command(name="link-channel")
-async def link_channel(
-    ctx: commands.Context,
-    action: str = "list",
+@bot.tree.command(
+    name="link-channel",
+    description="List or update the channels where /link is allowed.",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    action="Choose whether to list, add, remove, or clear allowed channels",
+    channel="Leave blank to use the current channel for add or remove",
+)
+@app_commands.choices(action=ACTION_CHOICES)
+async def link_channel_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
     channel: discord.TextChannel | None = None,
 ) -> None:
-    if ctx.guild is None:
-        await reply_temp(ctx, "This command only works inside a server.")
+    guild = interaction.guild
+    current_channel = interaction.channel
+    if guild is None or not isinstance(current_channel, (discord.TextChannel, discord.Thread)):
+        await send_ephemeral(interaction, "This command only works in server text channels and threads.")
         return
 
-    normalized_action = action.lower()
-    if normalized_action == "list":
-        allowed_channel_ids = get_allowed_channel_ids(ctx.guild.id)
+    if action.value == "list":
+        allowed_channel_ids = get_allowed_channel_ids(guild.id)
         if not allowed_channel_ids:
-            await reply_temp(ctx, "No channel restrictions are enabled. `!link` works in any text channel.")
+            await send_ephemeral(
+                interaction,
+                "No channel restrictions are enabled. `/link` works in any text channel.",
+            )
             return
 
         channel_list = ", ".join(
-            format_channel_reference(ctx.guild, channel_id)
+            format_channel_reference(guild, channel_id)
             for channel_id in allowed_channel_ids
         )
-        await reply_temp(ctx, f"`!link` is allowed in: {channel_list}", delete_after=15)
+        await send_ephemeral(interaction, f"`/link` is allowed in: {channel_list}")
         return
 
-    if not is_server_manager(ctx.author):
-        await reply_temp(ctx, "You need `Manage Server` to change channel permissions.")
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(interaction, "You need `Manage Server` to change channel permissions.")
         return
 
-    target_channel_id = channel.id if channel is not None else ctx.channel.id
-    target_channel_reference = format_channel_reference(ctx.guild, target_channel_id)
+    target_channel_id = channel.id if channel is not None else current_channel.id
+    target_channel_reference = format_channel_reference(guild, target_channel_id)
 
-    if normalized_action == "add":
-        if add_allowed_channel(ctx.guild.id, target_channel_id):
+    if action.value == "add":
+        if add_allowed_channel(guild.id, target_channel_id):
             logger.info(
                 "Added allowed channel guild=%s channel=%s by user=%s.",
-                ctx.guild.id,
+                guild.id,
                 target_channel_id,
-                ctx.author.id,
+                interaction.user.id,
             )
-            await reply_temp(ctx, f"`!link` is now allowed in {target_channel_reference}.")
+            await send_ephemeral(interaction, f"`/link` is now allowed in {target_channel_reference}.")
         else:
-            await reply_temp(ctx, f"{target_channel_reference} is already in the allowed channel list.")
+            await send_ephemeral(
+                interaction,
+                f"{target_channel_reference} is already in the allowed channel list.",
+            )
         return
 
-    if normalized_action == "remove":
-        if remove_allowed_channel(ctx.guild.id, target_channel_id):
+    if action.value == "remove":
+        if remove_allowed_channel(guild.id, target_channel_id):
             logger.info(
                 "Removed allowed channel guild=%s channel=%s by user=%s.",
-                ctx.guild.id,
+                guild.id,
                 target_channel_id,
-                ctx.author.id,
+                interaction.user.id,
             )
-            await reply_temp(ctx, f"`!link` is no longer allowed in {target_channel_reference}.")
+            await send_ephemeral(
+                interaction,
+                f"`/link` is no longer allowed in {target_channel_reference}.",
+            )
         else:
-            await reply_temp(ctx, f"{target_channel_reference} is not in the allowed channel list.")
+            await send_ephemeral(
+                interaction,
+                f"{target_channel_reference} is not in the allowed channel list.",
+            )
         return
 
-    if normalized_action == "clear":
-        clear_allowed_channels(ctx.guild.id)
-        logger.info("Cleared allowed channels in guild=%s by user=%s.", ctx.guild.id, ctx.author.id)
-        await reply_temp(ctx, "Channel restrictions cleared. `!link` now works in any text channel.")
-        return
-
-    await reply_temp(ctx, "Use `!link-channel list`, `add`, `remove`, or `clear`.")
+    clear_allowed_channels(guild.id)
+    logger.info("Cleared allowed channels in guild=%s by user=%s.", guild.id, interaction.user.id)
+    await send_ephemeral(interaction, "Channel restrictions cleared. `/link` now works in any text channel.")
 
 
-@bot.command(name="link-role")
-async def link_role(
-    ctx: commands.Context,
-    action: str = "list",
+@bot.tree.command(
+    name="link-role",
+    description="List or update the roles allowed to use /link.",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    action="Choose whether to list, add, remove, or clear allowed roles",
+    role="The role to add or remove",
+)
+@app_commands.choices(action=ACTION_CHOICES)
+async def link_role_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
     role: discord.Role | None = None,
 ) -> None:
-    if ctx.guild is None:
-        await reply_temp(ctx, "This command only works inside a server.")
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
-    normalized_action = action.lower()
-    if normalized_action == "list":
-        allowed_role_ids = get_allowed_role_ids(ctx.guild.id)
+    if action.value == "list":
+        allowed_role_ids = get_allowed_role_ids(guild.id)
         if not allowed_role_ids:
-            await reply_temp(ctx, "No role restrictions are enabled. Any member can use `!link`.")
+            await send_ephemeral(interaction, "No role restrictions are enabled. Any member can use `/link`.")
             return
 
         role_list = ", ".join(
-            format_role_reference(ctx.guild, role_id)
+            format_role_reference(guild, role_id)
             for role_id in allowed_role_ids
         )
-        await reply_temp(ctx, f"`!link` is restricted to: {role_list}", delete_after=15)
+        await send_ephemeral(interaction, f"`/link` is restricted to: {role_list}")
         return
 
-    if not is_server_manager(ctx.author):
-        await reply_temp(ctx, "You need `Manage Server` to change role permissions.")
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(interaction, "You need `Manage Server` to change role permissions.")
         return
 
-    if normalized_action in {"add", "remove"} and role is None:
-        await reply_temp(ctx, "Mention a role, for example `!link-role add @Mods`.")
+    if action.value in {"add", "remove"} and role is None:
+        await send_ephemeral(interaction, "Choose a role for add or remove.")
         return
 
-    if normalized_action == "add":
-        if add_allowed_role(ctx.guild.id, role.id):
+    if action.value == "add":
+        if add_allowed_role(guild.id, role.id):
             logger.info(
                 "Added allowed role guild=%s role=%s by user=%s.",
-                ctx.guild.id,
+                guild.id,
                 role.id,
-                ctx.author.id,
+                interaction.user.id,
             )
-            await reply_temp(ctx, f"`!link` is now restricted to include {role.mention}.")
+            await send_ephemeral(interaction, f"`/link` is now restricted to include {role.mention}.")
         else:
-            await reply_temp(ctx, f"{role.mention} is already in the allowed role list.")
+            await send_ephemeral(interaction, f"{role.mention} is already in the allowed role list.")
         return
 
-    if normalized_action == "remove":
-        if remove_allowed_role(ctx.guild.id, role.id):
+    if action.value == "remove":
+        if remove_allowed_role(guild.id, role.id):
             logger.info(
                 "Removed allowed role guild=%s role=%s by user=%s.",
-                ctx.guild.id,
+                guild.id,
                 role.id,
-                ctx.author.id,
+                interaction.user.id,
             )
-            await reply_temp(ctx, f"{role.mention} was removed from the allowed role list.")
+            await send_ephemeral(interaction, f"{role.mention} was removed from the allowed role list.")
         else:
-            await reply_temp(ctx, f"{role.mention} is not in the allowed role list.")
+            await send_ephemeral(interaction, f"{role.mention} is not in the allowed role list.")
         return
 
-    if normalized_action == "clear":
-        clear_allowed_roles(ctx.guild.id)
-        logger.info("Cleared allowed roles in guild=%s by user=%s.", ctx.guild.id, ctx.author.id)
-        await reply_temp(ctx, "Role restrictions cleared. Any member can use `!link` again.")
+    clear_allowed_roles(guild.id)
+    logger.info("Cleared allowed roles in guild=%s by user=%s.", guild.id, interaction.user.id)
+    await send_ephemeral(interaction, "Role restrictions cleared. Any member can use `/link` again.")
+
+
+@bot.tree.command(
+    name="link-status",
+    description="Show the current LinkBot configuration for this server.",
+)
+@app_commands.guild_only()
+async def link_status_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
-    await reply_temp(ctx, "Use `!link-role list`, `add`, `remove`, or `clear`.")
+    await send_ephemeral(interaction, "\n".join(status_lines(guild)))
+
+
+@bot.tree.command(
+    name="link-help",
+    description="Show a quick reference for LinkBot's slash commands.",
+)
+async def link_help_command(interaction: discord.Interaction) -> None:
+    help_lines = [
+        "**LinkBot Commands**",
+        "`/link` post a link and clean the current channel",
+        "`/safe-link` safely initialize a channel without touching earlier history",
+        "`/link-message` show or set the label above reposted links",
+        "`/link-message-reset` restore the default label",
+        "`/link-channel` list, add, remove, or clear allowed channels",
+        "`/link-role` list, add, remove, or clear allowed roles",
+        "`/link-status` show the current server settings",
+        "`/link-help` show this help message",
+        "Admins with `Manage Server` can always configure and use the bot, even if channel or role restrictions are enabled.",
+    ]
+    await send_ephemeral(interaction, "\n".join(help_lines))
 
 
 def main() -> None:
