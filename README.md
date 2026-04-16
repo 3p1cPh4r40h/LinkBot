@@ -8,12 +8,18 @@ When someone posts `!link https://example.com`, the bot reposts the link in a co
 
 LinkBot is already hosted, so most server owners do not need to run any code.
 
+Invite Link:
+
+https://discord.com/oauth2/authorize?client_id=1494387968796917882&permissions=68608&integration_type=0&scope=bot+applications.commands
+
 1. Open the bot invite link for your hosted LinkBot deployment.
 2. Choose your server.
 3. Approve the requested permissions.
 4. Add the bot to a test channel first, not a busy production channel.
 5. In Discord, run `!link-help` to see the available commands.
 6. Lock usage to one channel or one role before wider rollout.
+
+If you want to share LinkBot with someone else, send them the invite link above.
 
 ## Safe Setup First
 
