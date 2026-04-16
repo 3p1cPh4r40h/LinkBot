@@ -4,13 +4,16 @@ LinkBot turns a Discord channel into a clean, bot-managed list of links using sl
 
 Use `/link` to post a link in a polished format, keep a channel tidy, and maintain a consistent link feed for your server.
 
+Regular members only need `/link`.
+Server owners and admins handle setup by default, and can delegate specific setup commands to trusted roles through LinkBot itself.
+
 ## Add LinkBot To Your Server
 
 LinkBot is already hosted, so most server owners do not need to run any code.
 
 Invite Link:
 
-https://discord.com/oauth2/authorize?client_id=1494387968796917882&permissions=68608&integration_type=0&scope=bot+applications.commands
+[Add LinkBot to your server](https://discord.com/oauth2/authorize?client_id=1494387968796917882&permissions=68608&integration_type=0&scope=bot+applications.commands)
 
 1. Open the invite link above.
 2. Choose your server.
@@ -79,6 +82,7 @@ Instead:
 - Lets server admins customize the label above each link
 - Supports per-server channel restrictions
 - Supports per-server role restrictions
+- Supports per-command setup access for delegated staff roles
 
 ## What A Reposted Link Looks Like
 
@@ -123,7 +127,9 @@ After a channel has been initialized, new regular messages in that channel are r
 
 ## Slash Commands
 
-These are the commands server owners and admins will use most often.
+Regular members use `/link`.
+Server owners and admins use the setup commands below by default.
+If needed, they can delegate specific setup commands to trusted roles.
 
 ### `/link`
 
@@ -197,6 +203,26 @@ Examples:
 
 Show the current server configuration.
 
+### `/link-command-role`
+
+Grant or remove setup-command access for specific roles.
+
+Examples:
+
+```text
+/link-command-role action:List
+/link-command-role action:List command_name:/link-channel
+/link-command-role action:Add command_name:/link-status role:@Moderators
+/link-command-role action:Remove command_name:/link-status role:@Moderators
+/link-command-role action:Clear command_name:/link-status
+```
+
+Notes:
+
+- Owners/admins always keep access
+- This command is for setup and admin commands, not `/link`
+- `/link-role` still controls which roles may use `/link`
+
 ### `/link-help`
 
 Show a quick command reference.
@@ -207,7 +233,11 @@ Show a quick command reference.
 - If no roles are configured, any member can use `/link`
 - If channel restrictions are set, `/link` only works in those channels
 - If role restrictions are set, `/link` only works for members with one of those roles
-- Members with `Manage Server` or `Administrator` can always configure and use the bot
+- Members use `/link`
+- Owners/admins use `/safe-link`, `/link-message`, `/link-message-reset`, `/link-channel`, `/link-role`, `/link-status`, `/link-help`, and `/link-command-role` by default
+- Owners/admins can grant trusted roles access to specific setup commands with `/link-command-role`
+- `/link-role` controls access to `/link`
+- Owners and admins always keep full access even if delegated roles are added or removed
 - Admin and config responses are shown as ephemeral slash-command replies, which keeps setup clean in-channel
 
 ## Important Safety Notes

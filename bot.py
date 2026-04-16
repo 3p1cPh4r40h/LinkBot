@@ -27,6 +27,26 @@ ACTION_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="Remove", value="remove"),
     app_commands.Choice(name="Clear", value="clear"),
 ]
+ADMIN_COMMAND_KEYS: Final[list[str]] = [
+    "safe-link",
+    "link-message",
+    "link-message-reset",
+    "link-channel",
+    "link-role",
+    "link-status",
+    "link-help",
+    "link-command-role",
+]
+ADMIN_COMMAND_CHOICES: Final[list[app_commands.Choice[str]]] = [
+    app_commands.Choice(name="/safe-link", value="safe-link"),
+    app_commands.Choice(name="/link-message", value="link-message"),
+    app_commands.Choice(name="/link-message-reset", value="link-message-reset"),
+    app_commands.Choice(name="/link-channel", value="link-channel"),
+    app_commands.Choice(name="/link-role", value="link-role"),
+    app_commands.Choice(name="/link-status", value="link-status"),
+    app_commands.Choice(name="/link-help", value="link-help"),
+    app_commands.Choice(name="/link-command-role", value="link-command-role"),
+]
 
 logger = logging.getLogger("linkbot")
 
@@ -84,6 +104,13 @@ def normalize_settings(raw_settings: object) -> dict[str, dict[str, Any]]:
             "preserve_before_message_ids": normalize_id_map(
                 values.get("preserve_before_message_ids")
             ),
+            "command_role_ids": {
+                command_name: normalize_id_list(role_ids)
+                for command_name, role_ids in values.get("command_role_ids", {}).items()
+                if isinstance(command_name, str)
+            }
+            if isinstance(values.get("command_role_ids"), dict)
+            else {},
         }
 
     return normalized_settings
@@ -123,6 +150,7 @@ def get_guild_config(guild_id: int) -> dict[str, Any]:
             "allowed_role_ids": [],
             "managed_channel_ids": [],
             "preserve_before_message_ids": {},
+            "command_role_ids": {},
         }
         return guild_settings[guild_key]
 
@@ -132,6 +160,7 @@ def get_guild_config(guild_id: int) -> dict[str, Any]:
     guild_config.setdefault("allowed_role_ids", [])
     guild_config.setdefault("managed_channel_ids", [])
     guild_config.setdefault("preserve_before_message_ids", {})
+    guild_config.setdefault("command_role_ids", {})
     return guild_config
 
 
@@ -170,6 +199,57 @@ def get_preserve_before_message_id(guild_id: int, channel_id: int) -> int | None
         return raw_value
 
     return None
+
+
+def get_command_role_ids(guild_id: int, command_name: str) -> list[int]:
+    command_role_ids = get_guild_config(guild_id)["command_role_ids"]
+    raw_role_ids = command_role_ids.get(command_name, [])
+    return normalize_id_list(raw_role_ids)
+
+
+def get_all_command_role_ids(guild_id: int) -> dict[str, list[int]]:
+    raw_command_role_ids = get_guild_config(guild_id)["command_role_ids"]
+    return {
+        command_name: normalize_id_list(role_ids)
+        for command_name, role_ids in raw_command_role_ids.items()
+        if isinstance(command_name, str)
+    }
+
+
+def add_command_role(guild_id: int, command_name: str, role_id: int) -> bool:
+    command_role_ids = get_all_command_role_ids(guild_id)
+    current_role_ids = set(command_role_ids.get(command_name, []))
+    if role_id in current_role_ids:
+        return False
+
+    current_role_ids.add(role_id)
+    command_role_ids[command_name] = sorted(current_role_ids)
+    get_guild_config(guild_id)["command_role_ids"] = command_role_ids
+    save_settings()
+    return True
+
+
+def remove_command_role(guild_id: int, command_name: str, role_id: int) -> bool:
+    command_role_ids = get_all_command_role_ids(guild_id)
+    current_role_ids = set(command_role_ids.get(command_name, []))
+    if role_id not in current_role_ids:
+        return False
+
+    current_role_ids.remove(role_id)
+    if current_role_ids:
+        command_role_ids[command_name] = sorted(current_role_ids)
+    else:
+        command_role_ids.pop(command_name, None)
+    get_guild_config(guild_id)["command_role_ids"] = command_role_ids
+    save_settings()
+    return True
+
+
+def clear_command_roles(guild_id: int, command_name: str) -> None:
+    command_role_ids = get_all_command_role_ids(guild_id)
+    command_role_ids.pop(command_name, None)
+    get_guild_config(guild_id)["command_role_ids"] = command_role_ids
+    save_settings()
 
 
 def add_allowed_channel(guild_id: int, channel_id: int) -> bool:
@@ -246,7 +326,20 @@ def add_managed_channel(
 
 
 def normalize_url(value: str) -> str:
-    normalized_value = value.strip().strip("<>").rstrip(".,!?)")
+    normalized_value = value.strip()
+
+    while normalized_value.endswith(tuple(".,!?")):
+        normalized_value = normalized_value[:-1]
+
+    while normalized_value.startswith("<"):
+        normalized_value = normalized_value[1:]
+
+    while normalized_value.endswith(">"):
+        normalized_value = normalized_value[:-1]
+
+    while normalized_value.endswith(")") and normalized_value.count(")") > normalized_value.count("("):
+        normalized_value = normalized_value[:-1]
+
     if normalized_value.lower().startswith("www."):
         return f"https://{normalized_value}"
 
@@ -323,6 +416,10 @@ def format_role_reference(guild: discord.Guild, role_id: int) -> str:
     return role.mention
 
 
+def format_command_reference(command_name: str) -> str:
+    return f"`/{command_name}`"
+
+
 def current_channel_ids(channel: discord.abc.GuildChannel | discord.Thread) -> set[int]:
     channel_ids = {channel.id}
     if isinstance(channel, discord.Thread) and channel.parent_id is not None:
@@ -341,6 +438,18 @@ def is_managed_link_channel(channel: discord.TextChannel | discord.Thread) -> bo
         return True
 
     return bool(current_channel_ids(channel) & allowed_channel_ids)
+
+
+def has_command_access(member: discord.Member, command_name: str) -> bool:
+    if is_server_manager(member):
+        return True
+
+    allowed_role_ids = set(get_command_role_ids(member.guild.id, command_name))
+    if not allowed_role_ids:
+        return False
+
+    member_role_ids = {role.id for role in member.roles}
+    return bool(member_role_ids & allowed_role_ids)
 
 
 def get_link_access_denial_reason(
@@ -411,6 +520,23 @@ def status_lines(guild: discord.Guild) -> list[str]:
             for channel_id in safe_start_channel_ids
         )
 
+    command_role_lines = ["Command roles: Owners/admins only"]
+    all_command_role_ids = get_all_command_role_ids(guild.id)
+    if all_command_role_ids:
+        command_role_lines = ["Command roles:"]
+        for command_name in ADMIN_COMMAND_KEYS:
+            role_ids = all_command_role_ids.get(command_name, [])
+            if not role_ids:
+                continue
+
+            command_role_summary = ", ".join(
+                format_role_reference(guild, role_id)
+                for role_id in role_ids
+            )
+            command_role_lines.append(
+                f"{format_command_reference(command_name)}: {command_role_summary}"
+            )
+
     return [
         "**LinkBot Status**",
         f"Message label: `{message_prefix}`",
@@ -419,6 +545,7 @@ def status_lines(guild: discord.Guild) -> list[str]:
         f"Managed channels: {managed_summary}",
         f"Safe-start channels: {safe_start_summary}",
         f"Logs: `{LOG_FILE}`",
+        *command_role_lines,
     ]
 
 
@@ -776,13 +903,15 @@ async def link_command(interaction: discord.Interaction, url: str) -> None:
     description="Initialize a channel without deleting anything that was already there.",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(url="The first link to post in the safely initialized channel")
 async def safe_link_command(interaction: discord.Interaction, url: str) -> None:
-    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "safe-link",
+    ):
         await send_ephemeral(
             interaction,
-            "You need `Manage Server` to use `/safe-link` because it initializes a channel in preserve mode.",
+            "You need owner/admin access or an allowed role to use `/safe-link`.",
         )
         return
 
@@ -812,15 +941,21 @@ async def link_message_command(
         await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-message",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-message`.",
+        )
+        return
+
     if message_prefix is None:
         await send_ephemeral(
             interaction,
             f"Current link message: `{get_message_prefix(guild.id)}`",
         )
-        return
-
-    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
-        await send_ephemeral(interaction, "You need `Manage Server` to change the link message.")
         return
 
     cleaned_prefix = message_prefix.strip()
@@ -842,15 +977,20 @@ async def link_message_command(
     description="Reset the link label back to the default value.",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
 async def link_message_reset_command(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None:
         await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
-    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
-        await send_ephemeral(interaction, "You need `Manage Server` to reset the link message.")
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-message-reset",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-message-reset`.",
+        )
         return
 
     reset_message_prefix(guild.id)
@@ -879,6 +1019,16 @@ async def link_channel_command(
         await send_ephemeral(interaction, "This command only works in server text channels and threads.")
         return
 
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-channel",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-channel`.",
+        )
+        return
+
     if action.value == "list":
         allowed_channel_ids = get_allowed_channel_ids(guild.id)
         if not allowed_channel_ids:
@@ -893,10 +1043,6 @@ async def link_channel_command(
             for channel_id in allowed_channel_ids
         )
         await send_ephemeral(interaction, f"`/link` is allowed in: {channel_list}")
-        return
-
-    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
-        await send_ephemeral(interaction, "You need `Manage Server` to change channel permissions.")
         return
 
     target_channel_id = channel.id if channel is not None else current_channel.id
@@ -962,6 +1108,16 @@ async def link_role_command(
         await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-role",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-role`.",
+        )
+        return
+
     if action.value == "list":
         allowed_role_ids = get_allowed_role_ids(guild.id)
         if not allowed_role_ids:
@@ -973,10 +1129,6 @@ async def link_role_command(
             for role_id in allowed_role_ids
         )
         await send_ephemeral(interaction, f"`/link` is restricted to: {role_list}")
-        return
-
-    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
-        await send_ephemeral(interaction, "You need `Manage Server` to change role permissions.")
         return
 
     if action.value in {"add", "remove"} and role is None:
@@ -1015,6 +1167,137 @@ async def link_role_command(
 
 
 @bot.tree.command(
+    name="link-command-role",
+    description="List or update the roles allowed to use LinkBot setup commands.",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    action="Choose whether to list, add, remove, or clear allowed roles for a command",
+    command_name="Choose which setup command to manage",
+    role="The role to add or remove",
+)
+@app_commands.choices(action=ACTION_CHOICES, command_name=ADMIN_COMMAND_CHOICES)
+async def link_command_role_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    command_name: app_commands.Choice[str] | None = None,
+    role: discord.Role | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await send_ephemeral(interaction, "This command only works inside a server.")
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not is_server_manager(interaction.user):
+        await send_ephemeral(
+            interaction,
+            "Only server owners, administrators, or members with `Manage Server` can change command-role access.",
+        )
+        return
+
+    if action.value == "list":
+        if command_name is None:
+            lines = ["**Setup Command Role Access**"]
+            command_roles = get_all_command_role_ids(guild.id)
+            has_any_entries = False
+            for admin_command in ADMIN_COMMAND_KEYS:
+                role_ids = command_roles.get(admin_command, [])
+                if not role_ids:
+                    continue
+
+                has_any_entries = True
+                role_summary = ", ".join(
+                    format_role_reference(guild, role_id)
+                    for role_id in role_ids
+                )
+                lines.append(f"{format_command_reference(admin_command)}: {role_summary}")
+
+            if not has_any_entries:
+                lines.append("Owners/admins only. No extra roles have been granted setup-command access yet.")
+
+            await send_ephemeral(interaction, "\n".join(lines))
+            return
+
+        role_ids = get_command_role_ids(guild.id, command_name.value)
+        if not role_ids:
+            await send_ephemeral(
+                interaction,
+                f"{format_command_reference(command_name.value)} is currently limited to owners/admins only.",
+            )
+            return
+
+        role_summary = ", ".join(
+            format_role_reference(guild, role_id)
+            for role_id in role_ids
+        )
+        await send_ephemeral(
+            interaction,
+            f"{format_command_reference(command_name.value)} is also available to: {role_summary}",
+        )
+        return
+
+    if command_name is None:
+        await send_ephemeral(interaction, "Choose a command for add, remove, or clear.")
+        return
+
+    if action.value in {"add", "remove"} and role is None:
+        await send_ephemeral(interaction, "Choose a role for add or remove.")
+        return
+
+    if action.value == "add":
+        if add_command_role(guild.id, command_name.value, role.id):
+            logger.info(
+                "Added command role access guild=%s command=%s role=%s by user=%s.",
+                guild.id,
+                command_name.value,
+                role.id,
+                interaction.user.id,
+            )
+            await send_ephemeral(
+                interaction,
+                f"{role.mention} can now use {format_command_reference(command_name.value)}.",
+            )
+        else:
+            await send_ephemeral(
+                interaction,
+                f"{role.mention} already has access to {format_command_reference(command_name.value)}.",
+            )
+        return
+
+    if action.value == "remove":
+        if remove_command_role(guild.id, command_name.value, role.id):
+            logger.info(
+                "Removed command role access guild=%s command=%s role=%s by user=%s.",
+                guild.id,
+                command_name.value,
+                role.id,
+                interaction.user.id,
+            )
+            await send_ephemeral(
+                interaction,
+                f"{role.mention} can no longer use {format_command_reference(command_name.value)}.",
+            )
+        else:
+            await send_ephemeral(
+                interaction,
+                f"{role.mention} does not currently have access to {format_command_reference(command_name.value)}.",
+            )
+        return
+
+    clear_command_roles(guild.id, command_name.value)
+    logger.info(
+        "Cleared command role access guild=%s command=%s by user=%s.",
+        guild.id,
+        command_name.value,
+        interaction.user.id,
+    )
+    await send_ephemeral(
+        interaction,
+        f"{format_command_reference(command_name.value)} is now limited to owners/admins only.",
+    )
+
+
+@bot.tree.command(
     name="link-status",
     description="Show the current LinkBot configuration for this server.",
 )
@@ -1025,6 +1308,16 @@ async def link_status_command(interaction: discord.Interaction) -> None:
         await send_ephemeral(interaction, "This command only works inside a server.")
         return
 
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-status",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-status`.",
+        )
+        return
+
     await send_ephemeral(interaction, "\n".join(status_lines(guild)))
 
 
@@ -1032,7 +1325,18 @@ async def link_status_command(interaction: discord.Interaction) -> None:
     name="link-help",
     description="Show a quick reference for LinkBot's slash commands.",
 )
+@app_commands.guild_only()
 async def link_help_command(interaction: discord.Interaction) -> None:
+    if not isinstance(interaction.user, discord.Member) or not has_command_access(
+        interaction.user,
+        "link-help",
+    ):
+        await send_ephemeral(
+            interaction,
+            "You need owner/admin access or an allowed role to use `/link-help`.",
+        )
+        return
+
     help_lines = [
         "**LinkBot Commands**",
         "`/link` post a link and clean the current channel",
@@ -1041,9 +1345,10 @@ async def link_help_command(interaction: discord.Interaction) -> None:
         "`/link-message-reset` restore the default label",
         "`/link-channel` list, add, remove, or clear allowed channels",
         "`/link-role` list, add, remove, or clear allowed roles",
+        "`/link-command-role` delegate setup-command access to specific roles",
         "`/link-status` show the current server settings",
         "`/link-help` show this help message",
-        "Admins with `Manage Server` can always configure and use the bot, even if channel or role restrictions are enabled.",
+        "Owners/admins always keep full access, and can delegate setup commands to additional roles with `/link-command-role`.",
     ]
     await send_ephemeral(interaction, "\n".join(help_lines))
 
