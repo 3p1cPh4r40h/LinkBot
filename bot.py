@@ -47,6 +47,127 @@ ADMIN_COMMAND_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="/link-help", value="link-help"),
     app_commands.Choice(name="/link-command-role", value="link-command-role"),
 ]
+HELP_COMMAND_ORDER: Final[list[str]] = ["link", *ADMIN_COMMAND_KEYS]
+HELP_TOPIC_CHOICES: Final[list[app_commands.Choice[str]]] = [
+    app_commands.Choice(name="General help", value="general"),
+    app_commands.Choice(name="All commands", value="all"),
+    app_commands.Choice(name="/link", value="link"),
+    app_commands.Choice(name="/safe-link", value="safe-link"),
+    app_commands.Choice(name="/link-message", value="link-message"),
+    app_commands.Choice(name="/link-message-reset", value="link-message-reset"),
+    app_commands.Choice(name="/link-channel", value="link-channel"),
+    app_commands.Choice(name="/link-role", value="link-role"),
+    app_commands.Choice(name="/link-status", value="link-status"),
+    app_commands.Choice(name="/link-help", value="link-help"),
+    app_commands.Choice(name="/link-command-role", value="link-command-role"),
+]
+COMMAND_HELP: Final[dict[str, dict[str, object]]] = {
+    "link": {
+        "summary": "Post a link and clean the current channel.",
+        "access": "Any member, unless `/link-channel` or `/link-role` restrictions are enabled.",
+        "examples": ["/link url:https://example.com"],
+        "notes": [
+            "Reposts your link using the current message label.",
+            "Reposts older links it finds in the channel if they have not already been preserved.",
+            "Cleans non-link clutter after the channel has been initialized.",
+        ],
+    },
+    "safe-link": {
+        "summary": "Safely initialize a channel without touching earlier history.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/safe-link`.",
+        "examples": ["/safe-link url:https://example.com"],
+        "notes": [
+            "Use this only as the first LinkBot setup action in a channel.",
+            "Preserves everything already in the channel and starts LinkBot enforcement from that point forward.",
+            "After a channel is initialized, use `/link` for normal posting.",
+        ],
+    },
+    "link-message": {
+        "summary": "Show or update the label above reposted links.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-message`.",
+        "examples": [
+            "/link-message",
+            "/link-message message_prefix:Fresh Drop",
+        ],
+        "notes": [
+            "Leave the option blank to see the current label.",
+            "The label is stored per server.",
+        ],
+    },
+    "link-message-reset": {
+        "summary": "Reset the label above reposted links back to the default.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-message-reset`.",
+        "examples": ["/link-message-reset"],
+        "notes": [
+            f"Restores the label to `{DEFAULT_LINK_MESSAGE}`.",
+        ],
+    },
+    "link-channel": {
+        "summary": "List or update the channels where `/link` is allowed.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-channel`.",
+        "examples": [
+            "/link-channel action:List",
+            "/link-channel action:Add channel:#links",
+            "/link-channel action:Remove channel:#links",
+            "/link-channel action:Clear",
+        ],
+        "notes": [
+            "If no channels are configured, `/link` works in any text channel.",
+            "For add or remove, leaving `channel` blank uses the current channel.",
+        ],
+    },
+    "link-role": {
+        "summary": "List or update the roles allowed to use `/link`.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-role`.",
+        "examples": [
+            "/link-role action:List",
+            "/link-role action:Add role:@Moderators",
+            "/link-role action:Remove role:@Moderators",
+            "/link-role action:Clear",
+        ],
+        "notes": [
+            "If no roles are configured, any member can use `/link`.",
+        ],
+    },
+    "link-command-role": {
+        "summary": "Grant or remove setup-command access for specific roles.",
+        "access": "Only server owners, administrators, or members with `Manage Server`.",
+        "examples": [
+            "/link-command-role action:List",
+            "/link-command-role action:List command_name:/link-channel",
+            "/link-command-role action:Add command_name:/link-status role:@Moderators",
+            "/link-command-role action:Remove command_name:/link-status role:@Moderators",
+            "/link-command-role action:Clear command_name:/link-status",
+        ],
+        "notes": [
+            "Owners/admins always keep access.",
+            "This controls setup commands such as `/safe-link`, `/link-status`, and `/link-help`.",
+            "It does not control access to `/link`; use `/link-role` for that.",
+        ],
+    },
+    "link-status": {
+        "summary": "Show the current LinkBot configuration for the server.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-status`.",
+        "examples": ["/link-status"],
+        "notes": [
+            "Shows the current message label, allowed channels, allowed roles, managed channels, and command-role access.",
+        ],
+    },
+    "link-help": {
+        "summary": "Show LinkBot help, full command docs, or docs for one command.",
+        "access": "Owners/admins by default, or roles explicitly allowed for `/link-help`.",
+        "examples": [
+            "/link-help",
+            "/link-help topic:all",
+            "/link-help topic:safe-link",
+        ],
+        "notes": [
+            "Leave `topic` blank for the quick overview.",
+            "Use `all` to show docs for every command.",
+            "Pick a command name such as `safe-link` or `link-status` to see one command's docs.",
+        ],
+    },
+}
 
 logger = logging.getLogger("linkbot")
 
@@ -418,6 +539,111 @@ def format_role_reference(guild: discord.Guild, role_id: int) -> str:
 
 def format_command_reference(command_name: str) -> str:
     return f"`/{command_name}`"
+
+
+def build_message_pages(lines: list[str], *, max_length: int = 1900) -> list[str]:
+    pages: list[str] = []
+    current_lines: list[str] = []
+    current_length = 0
+
+    for line in lines:
+        line_length = len(line) + (1 if current_lines else 0)
+        if current_lines and current_length + line_length > max_length:
+            pages.append("\n".join(current_lines))
+            current_lines = [line]
+            current_length = len(line)
+            continue
+
+        current_lines.append(line)
+        current_length += line_length
+
+    if current_lines:
+        pages.append("\n".join(current_lines))
+
+    return pages
+
+
+async def send_ephemeral_pages(interaction: discord.Interaction, lines: list[str]) -> None:
+    pages = build_message_pages(lines)
+    if not pages:
+        return
+
+    await send_ephemeral(interaction, pages[0])
+    for page in pages[1:]:
+        await interaction.followup.send(page, ephemeral=True)
+
+
+def normalize_help_topic(topic: str | None) -> str:
+    if topic is None:
+        return "general"
+
+    normalized_topic = topic.strip().lower()
+    if normalized_topic.startswith("/"):
+        normalized_topic = normalized_topic[1:]
+
+    if not normalized_topic:
+        return "general"
+
+    return normalized_topic
+
+
+def command_help_lines(command_name: str) -> list[str]:
+    command_help = COMMAND_HELP[command_name]
+    lines = [
+        f"**{format_command_reference(command_name)}**",
+        str(command_help["summary"]),
+        f"Access: {command_help['access']}",
+    ]
+
+    for example in command_help["examples"]:
+        lines.append(f"Example: `{example}`")
+
+    for note in command_help["notes"]:
+        lines.append(f"Note: {note}")
+
+    return lines
+
+
+def general_help_lines() -> list[str]:
+    available_topics = ", ".join(
+        format_command_reference(command_name)
+        for command_name in HELP_COMMAND_ORDER
+    )
+    return [
+        "**LinkBot Help**",
+        "`/link-help` shows this quick overview.",
+        "`/link-help topic:all` shows the documentation for every command.",
+        "`/link-help topic:safe-link` shows the documentation for one command.",
+        f"Available command topics: {available_topics}",
+        "Owners/admins always keep setup-command access and can delegate most setup commands with `/link-command-role`.",
+    ]
+
+
+def all_commands_help_lines() -> list[str]:
+    lines = [
+        "**LinkBot Command Docs**",
+        "Use `/link-help topic:<command>` when you only want one command at a time.",
+    ]
+
+    for command_name in HELP_COMMAND_ORDER:
+        lines.append("")
+        lines.extend(command_help_lines(command_name))
+
+    return lines
+
+
+def help_lines_for_topic(topic: str | None) -> list[str] | None:
+    normalized_topic = normalize_help_topic(topic)
+    if normalized_topic == "general":
+        return general_help_lines()
+
+    if normalized_topic == "all":
+        return all_commands_help_lines()
+
+    if normalized_topic in COMMAND_HELP:
+        return command_help_lines(normalized_topic)
+
+    return None
 
 
 def current_channel_ids(channel: discord.abc.GuildChannel | discord.Thread) -> set[int]:
@@ -1323,10 +1549,15 @@ async def link_status_command(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="link-help",
-    description="Show a quick reference for LinkBot's slash commands.",
+    description="Show LinkBot help, all command docs, or docs for one command.",
 )
 @app_commands.guild_only()
-async def link_help_command(interaction: discord.Interaction) -> None:
+@app_commands.describe(topic="Leave blank for general help, or choose `all` or a command")
+@app_commands.choices(topic=HELP_TOPIC_CHOICES)
+async def link_help_command(
+    interaction: discord.Interaction,
+    topic: app_commands.Choice[str] | None = None,
+) -> None:
     if not isinstance(interaction.user, discord.Member) or not has_command_access(
         interaction.user,
         "link-help",
@@ -1337,20 +1568,18 @@ async def link_help_command(interaction: discord.Interaction) -> None:
         )
         return
 
-    help_lines = [
-        "**LinkBot Commands**",
-        "`/link` post a link and clean the current channel",
-        "`/safe-link` safely initialize a channel without touching earlier history",
-        "`/link-message` show or set the label above reposted links",
-        "`/link-message-reset` restore the default label",
-        "`/link-channel` list, add, remove, or clear allowed channels",
-        "`/link-role` list, add, remove, or clear allowed roles",
-        "`/link-command-role` delegate setup-command access to specific roles",
-        "`/link-status` show the current server settings",
-        "`/link-help` show this help message",
-        "Owners/admins always keep full access, and can delegate setup commands to additional roles with `/link-command-role`.",
-    ]
-    await send_ephemeral(interaction, "\n".join(help_lines))
+    help_lines = help_lines_for_topic(topic.value if topic is not None else None)
+    if help_lines is None:
+        available_topics = ", ".join(
+            ["`general`", "`all`", *[format_command_reference(command_name) for command_name in HELP_COMMAND_ORDER]]
+        )
+        await send_ephemeral(
+            interaction,
+            f"Unknown help topic. Try one of: {available_topics}",
+        )
+        return
+
+    await send_ephemeral_pages(interaction, help_lines)
 
 
 def main() -> None:

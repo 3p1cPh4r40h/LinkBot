@@ -20,7 +20,7 @@ Invite Link:
 3. Approve the requested permissions.
 4. Wait a short moment for slash commands to appear.
 5. Start in a test channel, not a busy production channel.
-6. Run `/link-help` in Discord to see the command list.
+6. Run `/link-help` in Discord for general help, `/link-help topic:all` for every command, or `/link-help topic:safe-link` for one command.
 7. Lock usage to one channel or one role before wider rollout.
 
 If you want to share LinkBot with someone else, send them the invite link above.
@@ -225,7 +225,15 @@ Notes:
 
 ### `/link-help`
 
-Show a quick command reference.
+Show general help, full command docs, or docs for one command.
+
+Examples:
+
+```text
+/link-help
+/link-help topic:all
+/link-help topic:safe-link
+```
 
 ## Permission Behavior
 
