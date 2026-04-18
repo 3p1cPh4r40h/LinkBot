@@ -14,12 +14,14 @@ from dotenv import load_dotenv
 
 
 DELETE_DELAY_SECONDS: Final[float] = 0.4
+NOTICE_DELETE_DELAY_SECONDS: Final[float] = 8.0
 DEFAULT_LINK_MESSAGE: Final[str] = "New Link"
 SETTINGS_FILE: Final[str] = "guild_settings.json"
 LOG_FILE: Final[str] = "linkbot.log"
 LOG_MAX_BYTES: Final[int] = 1_000_000
 LOG_BACKUP_COUNT: Final[int] = 3
 URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:https?://|www\.)\S+")
+MANAGED_CHANNEL_NOTICE: Final[str] = "This channel is only for links. Post a link directly or use `/link`."
 
 ACTION_CHOICES: Final[list[app_commands.Choice[str]]] = [
     app_commands.Choice(name="List", value="list"),
@@ -809,6 +811,30 @@ async def safe_delete(message: discord.Message) -> None:
         logger.warning("Failed to delete message %s", message.id)
 
 
+async def delete_after_delay(message: discord.Message, delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+    await safe_delete(message)
+
+
+async def send_managed_channel_notice(
+    channel: discord.TextChannel | discord.Thread,
+    member: discord.Member,
+) -> None:
+    try:
+        notice_message = await channel.send(f"{member.mention} {MANAGED_CHANNEL_NOTICE}")
+    except discord.Forbidden:
+        raise
+    except discord.HTTPException:
+        logger.warning(
+            "Failed to send links-only notice in guild=%s channel=%s.",
+            channel.guild.id,
+            channel.id,
+        )
+        return
+
+    asyncio.create_task(delete_after_delay(notice_message, NOTICE_DELETE_DELAY_SECONDS))
+
+
 async def clean_channel(
     channel: discord.TextChannel | discord.Thread,
     keep_message_ids: set[int],
@@ -1076,11 +1102,32 @@ async def on_message(message: discord.Message) -> None:
     if not is_managed_link_channel(message.channel):
         return
 
+    if not isinstance(message.author, discord.Member):
+        return
+
+    detected_urls = extract_urls_from_text(message.content)
+
     try:
+        if detected_urls:
+            message_prefix = get_message_prefix(message.guild.id)
+            for url in detected_urls:
+                await send_link_message(message.channel, message_prefix=message_prefix, url=url)
+
+            await safe_delete(message)
+            logger.info(
+                "Auto-reposted %s link(s) in managed channel guild=%s channel=%s user=%s.",
+                len(detected_urls),
+                message.guild.id,
+                message.channel.id,
+                message.author.id,
+            )
+            return
+
         await safe_delete(message)
+        await send_managed_channel_notice(message.channel, message.author)
     except discord.Forbidden:
         logger.warning(
-            "Missing permissions while removing invalid message in managed channel guild=%s channel=%s.",
+            "Missing permissions while moderating managed channel guild=%s channel=%s.",
             message.guild.id,
             message.channel.id,
         )

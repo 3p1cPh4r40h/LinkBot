@@ -78,7 +78,8 @@ Instead:
 - Reposts links in a clean bot-owned format
 - Offers a safe first-boot mode with `/safe-link` that preserves all earlier channel history
 - Preserves historical links during normal first cleanup instead of wiping them out
-- After a channel is initialized, watches new messages there and removes anything that is not a LinkBot-managed post
+- After a channel is initialized, automatically reformats new link messages there into LinkBot-managed posts
+- Removes non-link messages from managed channels and tells people the channel is only for links
 - Lets server admins customize the label above each link
 - Supports per-server channel restrictions
 - Supports per-server role restrictions
@@ -124,6 +125,7 @@ Safe `/safe-link` behavior:
 4. Starts enforcing LinkBot-only posting from that point onward
 
 After a channel has been initialized, new regular messages in that channel are removed automatically.
+If someone posts a normal link directly in a managed channel, LinkBot now detects it automatically and reposts it in the managed format without needing `/link`.
 
 ## Slash Commands
 
